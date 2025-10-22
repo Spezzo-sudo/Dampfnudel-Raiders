@@ -1,0 +1,225 @@
+import React, { useMemo } from 'react';
+import { useGameStore } from '@/store/gameStore';
+import { BUILDINGS, RESEARCH } from '@/constants';
+import ProgressBar from '@/components/ui/ProgressBar';
+import { BuildQueueItem, Mission, MissionStatus, ResourceType } from '@/types';
+
+const formatDuration = (ms: number) => {
+  if (ms < 0) {
+    ms = 0;
+  }
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds >= 5940) {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60)
+      .toString()
+      .padStart(2, '0');
+    const seconds = Math.floor(totalSeconds % 60)
+      .toString()
+      .padStart(2, '0');
+    return `${hours}:${minutes}:${seconds}`;
+  }
+  const minutes = Math.floor(totalSeconds / 60)
+    .toString()
+    .padStart(2, '0');
+  const seconds = Math.floor(totalSeconds % 60)
+    .toString()
+    .padStart(2, '0');
+  return `${minutes}:${seconds}`;
+};
+
+const QUEUE_ICONS: Record<'building' | 'research', string> = {
+  building: '🏭',
+  research: '🔬',
+};
+
+interface QueueCardProps {
+  entityId: string;
+  items: BuildQueueItem[];
+}
+
+const QueueCard: React.FC<QueueCardProps> = ({ entityId, items }) => {
+  const now = Date.now();
+  const entity = BUILDINGS[entityId] || RESEARCH[entityId];
+  if (!entity) {
+    return null;
+  }
+  const isBuilding = Boolean(BUILDINGS[entityId]);
+  const icon = isBuilding ? QUEUE_ICONS.building : QUEUE_ICONS.research;
+  const activeItem = items.find((item) => now >= item.startTime && now < item.endTime) ?? null;
+
+  return (
+    <li className="rounded-xl border border-yellow-800/30 bg-black/45 p-4 shadow-lg">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3 text-left">
+          <span className="text-2xl" aria-hidden>
+            {icon}
+          </span>
+          <div>
+            <p className="font-cinzel text-sm uppercase tracking-wide text-yellow-200">{entity.name}</p>
+            <p className="text-xs text-gray-300">{items.length} Auftrag{items.length > 1 ? 'e' : ''}</p>
+          </div>
+        </div>
+        {activeItem ? (
+          <span className="font-mono text-sm text-yellow-100">{formatDuration(activeItem.endTime - now)}</span>
+        ) : (
+          <span className="text-xs text-gray-400">Wartet</span>
+        )}
+      </div>
+      {activeItem && (
+        <div className="mt-3">
+          <ProgressBar
+            progress={((now - activeItem.startTime) / (activeItem.endTime - activeItem.startTime)) * 100}
+          />
+          <p className="mt-1 text-xs text-gray-300">
+            Stufe {activeItem.level - 1} → {activeItem.level}
+          </p>
+        </div>
+      )}
+      <ul className="mt-4 space-y-2 text-xs text-gray-300">
+        {items.map((item) => {
+          const statusLabel = now >= item.endTime ? 'Abgeschlossen' : now >= item.startTime ? 'In Arbeit' : 'Wartet';
+          return (
+            <li key={`${entityId}-${item.level}`} className="flex items-center justify-between">
+              <span>{statusLabel}</span>
+              <span className="font-mono">{formatDuration((item.endTime - now) > 0 ? item.endTime - now : item.endTime - item.startTime)}</span>
+            </li>
+          );
+        })}
+      </ul>
+    </li>
+  );
+};
+
+const useBottleneck = () => {
+  const resources = useGameStore((state) => state.resources);
+  const storage = useGameStore((state) => state.storage);
+  const kesseldruck = useGameStore((state) => state.kesseldruck);
+
+  return useMemo(() => {
+    if (kesseldruck.net < 0) {
+      return `Kesseldruck fällt um ${Math.abs(Math.round(kesseldruck.net))} bar`; // no timer without server ticks
+    }
+    const nearingFull = (Object.values(ResourceType) as ResourceType[])
+      .map((resource) => ({
+        resource,
+        remaining: storage[resource] - resources[resource],
+      }))
+      .sort((a, b) => a.remaining - b.remaining)[0];
+    if (nearingFull && nearingFull.remaining <= storage[nearingFull.resource] * 0.1) {
+      return `${nearingFull.resource} Lager füllt sich in Kürze`;
+    }
+    return 'Keine Engpässe in Sicht';
+  }, [kesseldruck.net, resources, storage]);
+};
+
+/**
+ * Übersicht mit Fokus auf Warteschlangen, Engpässen und Planetenstatus.
+ */
+const OverviewView: React.FC = () => {
+  const buildQueue = useGameStore((state) => state.buildQueue);
+  const buildings = useGameStore((state) => state.buildings);
+  const research = useGameStore((state) => state.research);
+  const missions = useGameStore((state) => state.missions);
+  const fleets = useGameStore((state) => state.fleets);
+  const bottleneck = useBottleneck();
+
+  const groupedQueue = useMemo(() => {
+    return buildQueue.reduce<Record<string, BuildQueueItem[]>>((acc, item) => {
+      if (!acc[item.entityId]) {
+        acc[item.entityId] = [];
+      }
+      acc[item.entityId].push(item);
+      return acc;
+    }, {});
+  }, [buildQueue]);
+
+  const missionGroups = useMemo(() => {
+    return missions.reduce<Record<MissionStatus, Mission[]>>(
+      (acc, mission) => {
+        acc[mission.status].push(mission);
+        return acc;
+      },
+      { enroute: [], arrived: [], resolved: [] },
+    );
+  }, [missions]);
+
+  const missionLabel = (mission: Mission) => {
+    const fleet = fleets.find((item) => item.id === mission.fleetId);
+    const eta = mission.arriveAt - Date.now();
+    return `${mission.type} · ${fleet ? fleet.id : 'Unbekannte Flotte'} · ETA ${formatDuration(eta)}`;
+  };
+
+  return (
+    <section className="space-y-8 pb-16">
+      <header className="space-y-2">
+        <h2 className="text-[clamp(1.8rem,1.2vw+1.5rem,2.4rem)] font-cinzel text-yellow-300">Planetenübersicht</h2>
+        <p className="text-sm text-gray-300">Behalte Baufortschritt, Engpässe und die aktuelle Produktionslage im Blick.</p>
+      </header>
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
+        <div className="flex flex-col gap-6 rounded-2xl border border-yellow-800/30 bg-black/45 p-6 text-center shadow-xl">
+          <img
+            src="https://picsum.photos/seed/steampunkplanet/500/300"
+            alt="Planet Chronos Prime"
+            className="mx-auto h-48 w-48 rounded-full border-4 border-yellow-600/50 object-cover shadow-lg"
+          />
+          <div className="space-y-1">
+            <h3 className="text-[clamp(1.3rem,1vw+1.1rem,1.8rem)] font-cinzel">Heimatplanet "Chronos Prime"</h3>
+            <p className="text-sm text-gray-400">Koordinaten: [1:1:1]</p>
+            <p className="text-xs uppercase tracking-wide text-yellow-200">{bottleneck}</p>
+          </div>
+        </div>
+        <div className="flex flex-col gap-4">
+          <div className="rounded-2xl border border-yellow-800/30 bg-black/50 p-6 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[clamp(1.2rem,1vw+1rem,1.6rem)] font-cinzel text-yellow-200">Bauschleife</h3>
+              <span className="text-xs text-gray-400">{buildQueue.length} aktive Aufträge</span>
+            </div>
+            {buildQueue.length > 0 ? (
+              <ul className="mt-4 space-y-3">
+                {Object.entries(groupedQueue).map(([entityId, items]) => (
+                  <QueueCard key={entityId} entityId={entityId} items={items} />
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-6 text-center text-sm text-gray-400">Keine Aufträge in der Warteschlange.</p>
+            )}
+          </div>
+          <div className="rounded-2xl border border-yellow-800/30 bg-black/50 p-6 shadow-xl">
+            <h3 className="text-[clamp(1.2rem,1vw+1rem,1.6rem)] font-cinzel text-yellow-200">Status</h3>
+            <dl className="mt-3 grid grid-cols-1 gap-3 text-sm text-gray-200 sm:grid-cols-2">
+              <div className="rounded-lg bg-black/40 p-3">
+                <dt className="text-xs uppercase tracking-wide text-yellow-300">Aktive Gebäude</dt>
+                <dd>{Object.keys(buildings).length} Strukturen</dd>
+              </div>
+              <div className="rounded-lg bg-black/40 p-3">
+                <dt className="text-xs uppercase tracking-wide text-yellow-300">Forschungsstufen</dt>
+                <dd>{Object.keys(research).length} Projekte</dd>
+              </div>
+            </dl>
+          </div>
+          <div className="rounded-2xl border border-yellow-800/30 bg-black/50 p-6 shadow-xl">
+            <h3 className="text-[clamp(1.2rem,1vw+1rem,1.6rem)] font-cinzel text-yellow-200">Missionen</h3>
+            <div className="mt-3 space-y-3 text-sm text-gray-200">
+              {(['enroute', 'arrived', 'resolved'] as MissionStatus[]).map((status) => (
+                <section key={status}>
+                  <h4 className="font-cinzel text-xs uppercase tracking-wide text-yellow-300">{status}</h4>
+                  <ul className="mt-1 space-y-1">
+                    {missionGroups[status].length === 0 && <li className="text-xs text-gray-400">Keine Missionen.</li>}
+                    {missionGroups[status].map((mission) => (
+                      <li key={mission.id} className="rounded bg-black/40 px-3 py-2">
+                        {missionLabel(mission)}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+};
+
+export default OverviewView;
